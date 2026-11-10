@@ -52,6 +52,23 @@ Files reviewed (current, at HEAD):
 **Deployed active markets (Ethereum), used to bound Investigator C to real configs:**
 - `reUSDsfrxUSDLP-crvUSD`, `sDOLA-crvUSD`, `sfrxUSD-crvUSD`, `svZCHF-crvUSD`, `syrupUSDC-crvUSD` (see `deployments/llamalend/ethereum/markets/`)
 
+**Additional contracts reviewed (expanded scope — "the rest of the repository"):**
+- `curve_stablecoin/lending/LendController.vy` — `available_balance`, `on_borrowed_token_transfer_in/out`, `_on_debt_increased` (borrow cap), `configure_lend`
+- `curve_stablecoin/lending/LendFactory.vy` — `create`, `markets`, `pause`/`unpause`, `set_custom_fee_receiver`, `check_contract`
+- `curve_stablecoin/lending/Vault.vy` — `deposit`/`mint`/`withdraw`/`redeem`, `_total_assets`, `MIN_ASSETS` (F-1 from Round 02, not re-submitted), `_convert_to_shares`/`_convert_to_assets`
+- `curve_stablecoin/lending/blueprint_registry.vy` (reference)
+- `curve_stablecoin/AMM.vy` (full read) — `calc_swap_out`, `_exchange`, `get_dy`/`get_dxdy`, `exchange`, `set_rate`, fee/rate handling
+- `curve_stablecoin/Configurator.vy` — `set_borrowing_discounts`, `set_monetary_policy`, `set_price_oracle` (max deviation check), `set_callback`, `set_amm_fee`, `set_view`
+- `curve_stablecoin/ControllerFactory.vy` — `add_market`, `_set_debt_ceiling` (mint/burn against residual), `set_debt_ceiling`, `rug_debt_ceiling`, `collect_fees_above_ceiling`, `total_debt`
+- `curve_stablecoin/ControllerView.vy` — health previews, `max_borrowable`/`min_collateral`, `tokens_to_shrink`, `users_with_health`, `_user_state`
+- `curve_stablecoin/MintController.vy` — thin adapter over core controller
+- `curve_stablecoin/Stablecoin.vy` — ERC20 + EIP-2612 permit, mint/burn access control
+- `curve_stablecoin/stabilizer/PegKeeperV2.vy`, `PegKeeperRegulator.vy`, `PegKeeper.vy`, `Salvation.vy`, `PegKeeperOffboarding.vy`
+- `curve_stablecoin/mpolicies/` — `KinkedMonetaryPolicy.vy` (and siblings), `wstETHRateCalculator.vy`
+- `curve_stablecoin/flashloan/FlashLender.vy` — ERC3156 flash loan, nonreentrant, repay check vs `debt_ceiling_residual`
+- `curve_stablecoin/lm_callback/LMCallback.vy` — CRV gauge-style reward accounting, `claimable_tokens`, checkpoint gating on `_attached()`
+- `curve_stablecoin/factory/OwnerProxy.vy` — DAO ownership proxy (commit/apply admin pattern)
+
 ## 4. Investigation results
 
 ### Investigator A — Partial repayment and liquidation
@@ -133,6 +150,22 @@ Oracle damping/cap behavior and ChainlinkEMA phase-switch handling were already 
 
 No hypothesis meets Medium/High severity criteria. No ordinary user can trigger unauthorized value extraction; no debt is erased/under-recorded/incorrectly attributed; no collateral becomes withdrawable without matching accounting reduction; no repayment/liquidation sequence leaves AMM and controller inconsistent; no unprivileged user causes measurable protocol loss.
 
+
+### Expanded scope — remaining contracts reviewed
+
+All remaining repository contracts were reviewed statically. None presents a novel, reproducible, financially meaningful vulnerability:
+
+| Area | Contracts reviewed | Result |
+|------|-------------------|--------|
+| Lend markets | `lending/LendController.vy`, `lending/LendFactory.vy`, `lending/Vault.vy`, `lending/blueprint_registry.vy` | `LendController._on_debt_increased` enforces borrow cap; `available_balance` tracking gated to vault/controller only; `LendFactory.create` validates oracle (`price()` == `price_w()`) and A/bounds; `Vault` deposit/withdraw/redeem respect `MIN_ASSETS`/`maxSupply`, `_total_assets()` consistent with controller. Vault `MIN_ASSETS` is F-1 from Round 02 (LOW/Informational) — not re-submitted. |
+| AMM core | `AMM.vy` (full) — `calc_swap_out`, `_exchange`, `get_dy`/`get_dxdy`, `exchange`, `set_rate`, fee/rate | Swap rounds `in_amount` up / `out_amount` down (safe for protocol); `nonreentrant` on state-changing swaps; `MAX_ORACLE_DN_POW` caps band travel (~50 ticks). No manipulation path to unauthorized extraction. |
+| Configurator / factories | `Configurator.vy`, `ControllerFactory.vy`, `MintController.vy`, `factory/OwnerProxy.vy` | All admin-gated (`_check_admin`/`_check_authorized` / ownable). `set_price_oracle` enforces `MAX_ORACLE_PRICE_DEVIATION` (50%) unless skipped with `max_value`. `ControllerFactory._set_debt_ceiling` mints/burns only against `debt_ceiling_residual` and balance. No cross-market asset extraction. |
+| Stabilizers | `stabilizer/PegKeeperV2.vy`, `PegKeeperRegulator.vy`, `PegKeeper.vy`, `Salvation.vy`, `PegKeeperOffboarding.vy` | PegKeeper profit calculation rounds safe (`_calc_profit_from` returns 0 when `lp_balance <= lp_debt`); regulator gates provide/withdraw by price range and debt ratios; admin actions use commit/apply delays. No user-triggered extraction. |
+| Monetary policies | `mpolicies/` — `KinkedMonetaryPolicy.vy` and siblings | `rate_write` permissioned via controller; rate math asserts non-negative and reserves >= debt. No attacker-controlled rate manipulation beyond documented behavior. |
+| Flash loan | `flashloan/FlashLender.vy` | `nonreentrant`, 0 fee, repayment checked against `debt_ceiling_residual(self)` (the contract's own ceiling, not user-controlled). No cross-contract reentrancy to steal funds. |
+| LM callback | `lm_callback/LMCallback.vy` | Checkpoint integrals gated on `_attached()` (live callback check latches `detached`); `claimable_tokens` checkpoints then reads `integrate_fraction - minted`. Standard Curve gauge accounting; no double-claim or inflation path. |
+| Stablecoin | `Stablecoin.vy` | Standard ERC20 + EIP-2612 permit; `mint` restricted to `minter`; `transferFrom` enforces allowance; domain separator handles chain ID. No novel issue. |
+
 ## 5. Candidate hypotheses rejected (with reasons)
 
 All candidates from Investigators A, B, and C are rejected above (see table in section 4.D). None demonstrated:
@@ -198,6 +231,6 @@ Per the mission rules: "A rounding difference is not automatically a vulnerabili
 
 **Whether a real vulnerability was confirmed:** No.
 **Whether it is novel and in scope:** N/A — none found.
-**Strongest evidence:** exhaustive static review of `controller.vy` (repay/`_repay_partial`/`liquidate`/`tokens_to_liquidate`), both partial-repay and transient-leverage zaps, the AMM withdraw/deposit_range/`get_x_down` path, and all deployed oracle adapter compositions; every accounting path reconciles and every potential edge case is either intentional behavior, a non-bounty-worthy DOS/revert, or already fixed/documented.
+**Strongest evidence:** exhaustive static review of `controller.vy` (repay/`_repay_partial`/`liquidate`/`tokens_to_liquidate`), both partial-repay and transient-leverage zaps, the AMM withdraw/deposit_range/`get_x_down`/`calc_swap_out` path, all deployed oracle adapter compositions, plus the expanded scope (LendController/LendFactory/Vault, AMM core, Configurator/ControllerFactory/OwnerProxy, PegKeeper/PegKeeperRegulator, monetary policies, FlashLender, LMCallback, Stablecoin). Every accounting path reconciles and every potential edge case is either intentional behavior, a non-bounty-worthy DOS/revert, or already fixed/documented.
 **Whether a bounty submission is justified:** No. Decision: NO-GO.
 **Exact next step:** None — do not submit a report. Re-prioritize to a different target or wait for a code change that advances beyond `f574bd50` before re-reviewing LlamaLend V2.
